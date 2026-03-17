@@ -1,4 +1,5 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+# 明确指定 Python 3 解释器（注释单独行，避免 shebang 解析错误）
 
 # Native
 import argparse
@@ -7,59 +8,131 @@ import os
 import pickle
 import sys
 import logging
+from datetime import datetime
 
 # Conware
 from conware.model import ConwareModel
 from conware import *
 
-logger = logging.getLogger(__name__)
+# ===================== 配置常量（可根据项目实际情况调整）=====================
+# 插桩记录文件后缀（对应之前采集的 recording.tsv）
+RECORDING_EXTENSION = "tsv"
+# 中断映射文件名称
+INTERRUPT_MAP = "interrupt.map"
+# 生成的模型文件名称
+MODEL_FILE = "conware_model.pkl"
+# 日志格式配置
+LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-if __name__ == "__main__":
-    # Get user input
-    parser = argparse.ArgumentParser()
-    parser.add_argument("recording_dir", default="recording",
-                        help="Directory containing all of the log files")
-    parser.add_argument("--debug", "-d", default=False, action='store_true',
-                        help="Enable debug output.")
+# 初始化日志器
+logger = logging.getLogger("conware-model-generate")
+
+def setup_logging(debug_mode: bool) -> None:
+    """配置日志输出格式和级别"""
+    log_level = logging.DEBUG if debug_mode else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format=LOG_FORMAT,
+        datefmt=LOG_DATE_FORMAT
+    )
+
+def load_interrupt_map(interrupt_file: str) -> dict:
+    """加载中断映射文件（兼容 Python 3 二进制模式）"""
+    interrupt_map = {}
+    if not os.path.exists(interrupt_file):
+        logger.info(f"Interrupt map file '{interrupt_file}' not found, using empty map")
+        return interrupt_map
+    
+    try:
+        with open(interrupt_file, "rb") as f:  # Python 3 必须用二进制模式读取 pickle
+            interrupt_map = pickle.load(f)
+        logger.debug(f"Successfully loaded interrupt map: {interrupt_map}")
+    except pickle.UnpicklingError as e:
+        logger.error(f"Failed to unpickle interrupt map file: {str(e)}")
+    except IOError as e:
+        logger.error(f"Failed to read interrupt map file: {str(e)}")
+    except Exception as e:
+        logger.error(f"Unexpected error loading interrupt map: {str(e)}")
+    
+    return interrupt_map
+
+def main():
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(
+        description="Generate Conware hardware behavior model from Arduino recording logs",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "recording_dir",
+        help="Directory containing Conware recording files (e.g., recording.tsv)"
+    )
+    parser.add_argument(
+        "--debug", "-d",
+        action="store_true",
+        default=False,
+        help="Enable debug-level logging output"
+    )
     args = parser.parse_args()
 
-    if not os.path.exists(args.recording_dir):
+    # 1. 配置日志
+    setup_logging(args.debug)
+
+    # 2. 校验输入目录
+    recording_dir = os.path.abspath(args.recording_dir)
+    if not os.path.exists(recording_dir):
+        logger.error(f"Recording directory '{recording_dir}' does not exist!")
         parser.print_help()
+        sys.exit(1)
+    
+    if not os.path.isdir(recording_dir):
+        logger.error(f"'{recording_dir}' is not a valid directory!")
+        sys.exit(1)
+
+    # 3. 查找记录文件（仅允许一个 .tsv 文件）
+    record_files = fnmatch.filter(
+        os.listdir(recording_dir),
+        f"*.{RECORDING_EXTENSION}"
+    )
+    
+    if len(record_files) == 0:
+        logger.error(f"No {RECORDING_EXTENSION} recording files found in '{recording_dir}'!")
+        sys.exit(1)
+    
+    if len(record_files) > 1:
+        logger.error(
+            f"Found {len(record_files)} recording files (expected 1) in '{recording_dir}': "
+            f"{', '.join(record_files)}"
+        )
+        sys.exit(1)
+
+    # 4. 加载中断映射
+    interrupt_file = os.path.join(recording_dir, INTERRUPT_MAP)
+    interrupt_map = load_interrupt_map(interrupt_file)
+
+    # 5. 处理记录文件并生成模型
+    record_file = record_files[0]
+    record_file_path = os.path.join(recording_dir, record_file)
+    logger.info(f"Starting model generation from recording file: {record_file_path}")
+
+    try:
+        # 初始化模型并训练
+        model = ConwareModel(interrupt_map=interrupt_map)
+        logger.info("Training Conware model...")
+        model.train(record_file_path)
+
+        # 保存模型
+        output_model_path = os.path.join(recording_dir, MODEL_FILE)
+        logger.info(f"Saving trained model to: {output_model_path}")
+        print(f"Saving model ({output_model_path})...")  # Python 3 兼容的 print 语法
+        model.save(output_model_path)
+
+        logger.info(f"Model generation completed successfully! Model saved to: {output_model_path}")
         sys.exit(0)
 
-    # Setup Logging
-    if args.debug:
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.INFO)
+    except Exception as e:
+        logger.error(f"Failed to generate model: {str(e)}", exc_info=args.debug)
+        sys.exit(1)
 
-    # First, let's just read our log into a nice internal structure
-    files = fnmatch.filter(os.listdir(args.recording_dir),
-                           "*.%s" % RECORDING_EXTENSION)
-
-    if len(files) != 1:
-        logger.error("It looks like there is less than or more than 1 "
-                     "recording "
-                     "in the given directory!")
-        parser.print_help()
-        sys.exit(0)
-
-    # Do we already know how certain interrupts work?
-    interrupt_file = os.path.join(args.recording_dir, INTERRUPT_MAP)
-    interrupt_map = {}
-    # if os.path.exists(interrupt_file):
-    #     logger.info("Found interrupt map file, loading..")
-    #     with open(interrupt_file, "r") as f:
-    #         interrupt_map = pickle.load(f)
-    # interrupt_map = {
-    #     24: (1074661384, 2),
-    #     (1074661384, 2): 24
-    # }
-
-    for f in files:
-        logger.info("Opening %s..." % f)
-        p = ConwareModel(interrupt_map=interrupt_map)
-        p.train(os.path.join(args.recording_dir, f))
-        output_model = os.path.join(args.recording_dir, MODEL_FILE)
-        print "Saving model (%s)..." % output_model
-        p.save(output_model)
+if __name__ == "__main__":
+    main()
