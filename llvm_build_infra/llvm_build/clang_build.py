@@ -1,200 +1,263 @@
 import os
-from multiprocessing import Pool
-from log_stuff import *
 import json
+from multiprocessing import Pool
+from typing import List, Tuple, Dict, Optional, Any
+from log_stuff import log_info, log_success, log_error  # 假设log_stuff提供这些日志函数
 
-# UTILITIES FUNCTION
-# target optimization to be used for llvm
+# ===================== 配置常量 =====================
+# LLVM 目标优化标志
 TARGET_OPTIMIZATION_FLAGS = ['-O0']
-# debug flags to be used by llvm
+# LLVM 调试信息标志
 DEBUG_INFO_FLAGS = ['-g']
+# 架构目标关键字
 ARCH_TARGET = '-target'
-# ARM 32 architecture flag for LLVM
+# ARM 32位 LLVM 架构标识
 ARM_32_LLVM_ARCH = 'armv7'
-# flags to disable some llvm warnings
+# 禁用 LLVM 警告的标志
 DISABLE_WARNINGS = ['-Wno-return-type', '-w', '-fshort-enums']
-# path to the clang binary
+# 默认 Clang 二进制路径
 CLANG_PATH = 'clang'
+# 生成 LLVM 位码的标志
 EMIT_LLVM_FLAG = '-emit-llvm'
 
 
-def _run_program((workdir, cmd_to_run)):
+# ===================== 工具函数 =====================
+def _run_program(args: Tuple[str, str]) -> None:
     """
-        Run the given program with in the provided directory.
+    在指定工作目录运行编译命令
+    :param args: 元组(工作目录, 要执行的命令)
     :return: None
     """
+    workdir, cmd_to_run = args  # 修复Python3元组解包问题
     curr_dir = os.getcwd()
-    os.chdir(workdir)
-    os.system(cmd_to_run)
-    os.chdir(curr_dir)
+    try:
+        os.chdir(workdir)
+        log_info(f"执行命令: {cmd_to_run} (工作目录: {workdir})")
+        os.system(cmd_to_run)
+    except Exception as e:
+        log_error(f"执行命令失败: {cmd_to_run}, 错误: {str(e)}")
+    finally:
+        os.chdir(curr_dir)  # 确保切回原目录
 
 
-def _is_allowed_flag(curr_flag):
+def _is_allowed_flag(curr_flag: str) -> bool:
     """
-        Function which checks, if a gcc flag is allowed in llvm command line.
-    :param curr_flag: flag to include in llvm
-    :return: True/False
+    检查GCC标志是否允许在LLVM命令行中使用
+    :param curr_flag: 待检查的编译标志
+    :return: 允许返回True，否则False
     """
-    # if this is a optimization flag, remove it.
-    #if str(curr_flag)[:2] == "-O":
-    #    return False
-
+    # 过滤优化标志（保留原逻辑，可根据需要启用）
+    # if curr_flag.startswith("-O"):
+    #     return False
     return True
 
 
-def _get_clang_build_str(clang_path, build_args, src_build_dir, work_dir,
-                         src_file_path, output_file_path, llvm_bit_code_out):
+def _get_clang_build_str(
+        clang_path: str,
+        build_args: List[str],
+        src_build_dir: str,
+        work_dir: str,
+        src_file_path: str,
+        output_file_path: str,
+        llvm_bit_code_out: str
+) -> Tuple[str, str, str, str, str, str, str]:
     """
-        Given a compilation command from the json, this function returns the clang based build string.
-        assuming that the original was built with gcc
-    :param clang_path: Path to clang.
-    :param build_args: original arguments to the compiler.
-    :param src_build_dir: Path to the original build directory given to arduino builder.
-    :param work_dir: Directory where the original command was run.
-    :param src_file_path: Path to the source file being compiled.
-    :param output_file_path: Path to the original object file.
-    :param llvm_bit_code_out: Folder where all the linked bitcode files should be stored.
-    :return: (workdir,
-              original obj file,
-              command to convert into bitcode,
-              command to generate object code,
-              command to generate object code from bitcode)
+    将GCC编译命令转换为Clang命令，生成LLVM位码和目标文件相关命令
+    :param clang_path: Clang二进制路径
+    :param build_args: 原始编译器参数
+    :param src_build_dir: Arduino构建器的原始构建目录
+    :param work_dir: 原始命令运行目录
+    :param src_file_path: 待编译的源文件路径
+    :param output_file_path: 原始目标文件路径
+    :param llvm_bit_code_out: LLVM位码输出目录
+    :return: (工作目录, 原始目标文件, 目标位码文件, 位码转目标文件模板命令,
+             生成位码的命令, 生成LLVM目标文件的命令, 从位码生成目标文件的命令)
     """
+    modified_build_args = [clang_path, EMIT_LLVM_FLAG]
+    # 添加架构目标
+    modified_build_args.extend([ARCH_TARGET, ARM_32_LLVM_ARCH])
+    # 添加调试和优化标志
+    modified_build_args.extend(DEBUG_INFO_FLAGS)
+    modified_build_args.extend(TARGET_OPTIMIZATION_FLAGS)
+    # 添加禁用警告标志
+    modified_build_args.extend(DISABLE_WARNINGS)
 
-    curr_src_file = src_file_path
-    modified_build_args = list()
-
-    modified_build_args.append(clang_path)
-    modified_build_args.append(EMIT_LLVM_FLAG)
-    # Handle Target flags
-    modified_build_args.append(ARCH_TARGET)
-    modified_build_args.append(ARM_32_LLVM_ARCH)
-
-    # handle debug flags
-    for curr_d_flg in DEBUG_INFO_FLAGS:
-        modified_build_args.append(curr_d_flg)
-    # handle optimization flags
-    for curr_op in TARGET_OPTIMIZATION_FLAGS:
-        modified_build_args.append(curr_op)
-
-    for curr_war_op in DISABLE_WARNINGS:
-        modified_build_args.append(curr_war_op)
-
-    rel_obj_file = output_file_path.split(src_build_dir)[-1]
-    if rel_obj_file.startswith('/'):
-        rel_obj_file = rel_obj_file[1:]
+    # 计算相对目标文件路径，构建位码输出目录
+    rel_obj_file = output_file_path.split(src_build_dir)[-1].lstrip('/')
     target_out_dir = os.path.join(llvm_bit_code_out, os.path.dirname(rel_obj_file))
-    if not os.path.exists(target_out_dir):
-        os.makedirs(target_out_dir)
-    target_bc_file = os.path.join(target_out_dir, os.path.basename(rel_obj_file) + ".bc")
+    os.makedirs(target_out_dir, exist_ok=True)  # 简化目录创建（Python3.2+支持）
+    target_bc_file = os.path.join(target_out_dir, f"{os.path.basename(output_file_path)}.bc")
 
+    # 过滤允许的编译参数
     for curr_op in build_args:
         if _is_allowed_flag(curr_op):
             modified_build_args.append(curr_op)
 
-    to_obj_from_bc_build_args = list(modified_build_args)
+    # 构建从位码生成目标文件的参数（移除emit-llvm）
+    to_obj_from_bc_build_args = modified_build_args.copy()
     to_obj_from_bc_build_args.remove(EMIT_LLVM_FLAG)
+    bitcode_to_obj_file_template = to_obj_from_bc_build_args.copy()
 
-    # tell clang to compile.
-    modified_build_args.append("-c")
-    modified_build_args.append(curr_src_file)
-
-    bitcode_to_obj_file_template = list(to_obj_from_bc_build_args)
-
-    to_obj_from_bc_build_args.append("-c")
-    to_obj_from_bc_build_args.append(target_bc_file)
-
-    modified_build_args.append("-o")
-    to_obj_from_bc_build_args.append("-o")
-    # to convert into object file directly!?
-    # just remove the emit-llvm flag.
-    to_obj_file_build_args = list(modified_build_args)
+    # 构建生成位码的命令
+    modified_build_args.extend(["-c", src_file_path, "-o", target_bc_file])
+    # 构建直接生成LLVM目标文件的命令
+    to_obj_file_build_args = modified_build_args.copy()
     to_obj_file_build_args.remove(EMIT_LLVM_FLAG)
-    to_obj_file_build_args.append(target_bc_file[:-2] + "llvm.obj")
+    to_obj_file_build_args.append(f"{target_bc_file[:-3]}.llvm.obj")  # 修复后缀截取（.bc → 空）
+    # 构建从位码生成目标文件的命令
+    to_obj_from_bc_build_args.extend(["-c", target_bc_file, "-o", f"{target_bc_file}_frombc.obj"])
 
-    modified_build_args.append(target_bc_file)
-    to_obj_from_bc_build_args.append(target_bc_file + "_frombc.obj")
-
-    return work_dir, output_file_path, \
-           target_bc_file, \
-           ' '.join(bitcode_to_obj_file_template), \
-           ' '.join(modified_build_args), \
-           ' '.join(to_obj_file_build_args), \
-           ' '.join(to_obj_from_bc_build_args)
+    return (
+        work_dir, output_file_path, target_bc_file,
+        ' '.join(bitcode_to_obj_file_template),
+        ' '.join(modified_build_args),
+        ' '.join(to_obj_file_build_args),
+        ' '.join(to_obj_from_bc_build_args)
+    )
 
 
-def build_using_clang(compile_commands, original_build_base,
-                      clang_path, llvm_bc_out, transformation_so=None, opt_path=None):
+def build_using_clang(
+        compile_commands: List[Any],  # 假设compile_commands是包含编译命令对象的列表
+        original_build_base: str,
+        clang_path: str = CLANG_PATH,
+        llvm_bc_out: str = "./llvm_bc_out",
+        transformation_so: Optional[str] = None,
+        opt_path: Optional[str] = None
+) -> None:
+    """
+    使用Clang编译代码并生成LLVM位码，可选执行LLVM变换并转换回目标文件
+    :param compile_commands: 编译命令列表（包含src_file/output_file/work_dir/curr_args等属性）
+    :param original_build_base: 原始构建基础目录
+    :param clang_path: Clang二进制路径
+    :param llvm_bc_out: LLVM位码输出目录
+    :param transformation_so: LLVM变换插件(.so)路径
+    :param opt_path: LLVM opt工具路径
+    :return: None
+    """
+    # 创建输出目录
+    os.makedirs(llvm_bc_out, exist_ok=True)
+    # 定义输出文件路径
     output_llvm_sh_file = os.path.join(llvm_bc_out, 'clang_build.json')
     human_llvm_txt_file = os.path.join(llvm_bc_out, 'clang_build.txt')
-    fp_out = open(output_llvm_sh_file, 'w')
-    fp_human_out = open(human_llvm_txt_file, 'w')
-    log_info("Writing all compilation commands in json format to", output_llvm_sh_file)
-    log_info("Writing all compilation commands in human usable form to", human_llvm_txt_file)
-    all_compilation_commands = []
-    target_output_commands = []
-    add_comma = False
-    fp_human_out.write("{")
-    transformation_info = {}
-    for curr_compilation_command in compile_commands:
-        work_dir, orig_output, target_bc_file, \
-        bitcode_to_obj_file_template, target_command_bc_cmd, \
-        target_obj_cmd, target_bc_to_obj_cmd = _get_clang_build_str(clang_path, curr_compilation_command.curr_args,
-                                                                    original_build_base,
-                                                                    curr_compilation_command.work_dir,
-                                                                    curr_compilation_command.src_file,
-                                                                    curr_compilation_command.output_file,
-                                                                    llvm_bc_out)
+
+    log_info(f"将编译命令写入JSON文件: {output_llvm_sh_file}")
+    log_info(f"将可读格式编译命令写入TXT文件: {human_llvm_txt_file}")
+
+    all_compilation_commands: List[Tuple[str, str]] = []
+    target_output_commands: List[Dict[str, str]] = []
+    transformation_info: Dict[str, Tuple[str, str]] = {}
+
+    # 处理每个编译命令
+    for idx, curr_compilation_command in enumerate(compile_commands):
+        try:
+            (work_dir, orig_output, target_bc_file,
+             bitcode_to_obj_file_template, target_command_bc_cmd,
+             target_obj_cmd, target_bc_to_obj_cmd) = _get_clang_build_str(
+                clang_path, curr_compilation_command.curr_args,
+                original_build_base, curr_compilation_command.work_dir,
+                curr_compilation_command.src_file,
+                curr_compilation_command.output_file,
+                llvm_bc_out
+            )
+        except Exception as e:
+            log_error(f"处理第{idx}个编译命令失败: {str(e)}，跳过该命令")
+            continue
+
         all_compilation_commands.append((work_dir, target_command_bc_cmd))
-        curr_dict = {}
-        curr_dict["orig_obj_file"] = orig_output
-        curr_dict["to_llvm_bc"] = target_command_bc_cmd
-        curr_dict["to_llvm_obj"] = target_obj_cmd
-        curr_dict["from_llvm_bc_to_obj"] = target_bc_to_obj_cmd
+        # 构建命令字典
+        cmd_dict = {
+            "orig_obj_file": orig_output,
+            "to_llvm_bc": target_command_bc_cmd,
+            "to_llvm_obj": target_obj_cmd,
+            "from_llvm_bc_to_obj": target_bc_to_obj_cmd
+        }
+        target_output_commands.append(cmd_dict)
         transformation_info[orig_output] = (target_bc_file, bitcode_to_obj_file_template)
-        if add_comma:
-            fp_human_out.write(':')
-        fp_human_out.write("[")
-        fp_human_out.write('"orig_obj_file": \"' + orig_output + '",\n')
-        fp_human_out.write('"to_llvm_bc": \"' + target_command_bc_cmd + '",\n')
-        fp_human_out.write('"to_llvm_obj": \"' + target_obj_cmd + '",\n')
-        fp_human_out.write('"from_llvm_bc_to_obj": \"' + target_bc_to_obj_cmd + '"')
-        fp_human_out.write("]")
-        add_comma = True
-        target_output_commands.append(curr_dict)
 
-    fp_human_out.write("}")
-    fp_human_out.close()
-    fp_out.write("{")
-    fp_out.write(json.dumps(target_output_commands, indent=4, sort_keys=True))
-    fp_out.write("}")
-    fp_out.close()
+    # 写入可读格式的TXT文件
+    with open(human_llvm_txt_file, 'w', encoding='utf-8') as fp_human_out:
+        fp_human_out.write(json.dumps(target_output_commands, indent=4, ensure_ascii=False))
 
-    log_info("Got:", len(all_compilation_commands), "commands to process. Running in multiprocessor mode.")
-    p = Pool()
-    p.map(_run_program, all_compilation_commands)
-    log_info("Finished running compilation commands in multiprocessor mode.")
+    # 写入JSON文件（修复原格式错误）
+    with open(output_llvm_sh_file, 'w', encoding='utf-8') as fp_out:
+        json.dump(target_output_commands, fp_out, indent=4, sort_keys=True, ensure_ascii=False)
 
-    if transformation_so is not None and opt_path is not None:
-        log_info("Running transformation and converting it back to obj file.")
+    # 多进程执行编译命令
+    if all_compilation_commands:
+        log_info(f"共获取{len(all_compilation_commands)}个编译命令，启动多进程执行")
+        with Pool() as p:  # 使用上下文管理器自动释放Pool资源
+            p.map(_run_program, all_compilation_commands)
+        log_info("多进程编译命令执行完成")
+    else:
+        log_info("无编译命令需要执行，跳过多进程步骤")
+
+    # 执行LLVM变换（如果指定了插件和opt路径）
+    if transformation_so and opt_path:
+        log_info("开始执行LLVM变换并转换回目标文件")
         for curr_output_obj in transformation_info.keys():
-            orig_bc_file = transformation_info[curr_output_obj][0]
-            if os.path.exists(orig_bc_file):
-                fp = open(orig_bc_file, "r")
-                if fp.read(2) == "BC":
-                    transformation_bc_file = orig_bc_file + ".transform.bc"
-                    transformation_command = opt_path + "  -load " + transformation_so + " -logmmio " + \
-                                             orig_bc_file + " -o " + transformation_bc_file
-                    os.system(transformation_command)
-                    bc_to_obj_cmd = transformation_info[curr_output_obj][1] + \
-                                    " -c " + transformation_bc_file + \
-                                    " -o " + curr_output_obj
+            orig_bc_file, bitcode_to_obj_template = transformation_info[curr_output_obj]
+            if not os.path.exists(orig_bc_file):
+                log_error(f"位码文件不存在: {orig_bc_file}，跳过变换")
+                continue
 
-                    os.system(bc_to_obj_cmd)
-                else:
-                    os.system("cp " + orig_bc_file + " " + curr_output_obj)
-                fp.close()
-        log_success("Finished running transformation passes.")
+            # 检查位码文件有效性
+            try:
+                with open(orig_bc_file, 'rb') as fp:  # 二进制模式读取
+                    header = fp.read(2)
+                    if header != b"BC":  # 位码文件魔数是BC（二进制）
+                        log_error(f"位码文件无效: {orig_bc_file}，直接复制原文件")
+                        os.system(f"cp {orig_bc_file} {curr_output_obj}")
+                        continue
+
+                # 执行变换命令
+                transformation_bc_file = f"{orig_bc_file}.transform.bc"
+                transformation_command = (
+                    f"{opt_path} -load {transformation_so} -logmmio "
+                    f"{orig_bc_file} -o {transformation_bc_file}"
+                )
+                log_info(f"执行变换命令: {transformation_command}")
+                os.system(transformation_command)
+
+                # 从变换后的位码生成目标文件
+                bc_to_obj_cmd = (
+                    f"{bitcode_to_obj_template} -c {transformation_bc_file} "
+                    f"-o {curr_output_obj}"
+                )
+                log_info(f"位码转目标文件: {bc_to_obj_cmd}")
+                os.system(bc_to_obj_cmd)
+            except Exception as e:
+                log_error(f"处理变换文件{orig_bc_file}失败: {str(e)}")
+        log_success("LLVM变换执行完成")
+    else:
+        log_info("未指定变换插件或opt路径，跳过LLVM变换步骤")
 
 
+# 示例调用（可选，用于测试）
+if __name__ == "__main__":
+    # 模拟编译命令对象（根据实际场景调整）
+    class MockCompileCommand:
+        def __init__(self, curr_args, work_dir, src_file, output_file):
+            self.curr_args = curr_args
+            self.work_dir = work_dir
+            self.src_file = src_file
+            self.output_file = output_file
 
+    # 构建模拟编译命令列表
+    mock_commands = [
+        MockCompileCommand(
+            curr_args=["-x", "c", "-Wall"],
+            work_dir="./src",
+            src_file="./src/test.c",
+            output_file="./build/test.o"
+        )
+    ]
+
+    # 调用构建函数
+    build_using_clang(
+        compile_commands=mock_commands,
+        original_build_base="./build",
+        clang_path="clang",
+        llvm_bc_out="./llvm_bc_out",
+        # transformation_so="./transform.so",  # 实际使用时取消注释
+        # opt_path="opt"  # 实际使用时取消注释
+    )
