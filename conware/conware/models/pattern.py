@@ -10,7 +10,6 @@ logger = logging.getLogger(__name__)
 class PatternModel(MemoryModel):
     def __init__(self, init_value=0, address=None):
         self.value = init_value
-        # self.read_pattern = []
         self.encoded_pattern = []
         self.count = 0
         self.index = 0
@@ -20,15 +19,15 @@ class PatternModel(MemoryModel):
         if len(self.read_patterns[self.value]) == 0:
             return "<PatternModel (empty)>"
         elif len(self.read_patterns[self.value][self.index]) > 5:
-            return "<PatternModel (%s) [%d items]>" % (",".join(
-                [str(x) for x in self.read_patterns.keys()]), len(
-                self.read_patterns[self.value][self.index]))
+            return "<PatternModel (%s) [%d items]>" % (
+                ",".join([str(x) for x in self.read_patterns.keys()]),
+                len(self.read_patterns[self.value][self.index])
+            )
         else:
-            return "<PatternModel (%s) %s>" % (",".join(
-                [str(x) for x in self.read_patterns.keys()]),
-                                               self.read_patterns[
-                                                   self.value][
-                                                   self.index])
+            return "<PatternModel (%s) %s>" % (
+                ",".join([str(x) for x in self.read_patterns.keys()]),
+                self.read_patterns[self.value][self.index]
+            )
 
     def __repr__(self):
         return self.__str__()
@@ -39,15 +38,13 @@ class PatternModel(MemoryModel):
             return False
 
         # Are the read patterns equal?
-        if self.read_patterns[self.value][self.index] == \
-                other_model.read_patterns[other_model.value][other_model.index]:
+        if self.read_patterns[self.value][self.index] == other_model.read_patterns[other_model.value][other_model.index]:
             return True
         else:
             if len(self.encoded_pattern) != len(other_model.encoded_pattern):
                 return False
             for idx, x in enumerate(self.encoded_pattern):
-                if x[0] != \
-                        other_model.encoded_pattern[idx][0]:
+                if x[0] != other_model.encoded_pattern[idx][0]:
                     return False
 
         return True
@@ -62,6 +59,12 @@ class PatternModel(MemoryModel):
         :param value:
         :return:
         """
+        # 防护：空字典时直接初始化
+        if not self.read_patterns:
+            self.read_patterns[value] = []
+            self.value = value
+            self.index = 0
+            return True
 
         # have we seen this value?
         if value in self.read_patterns:
@@ -69,19 +72,25 @@ class PatternModel(MemoryModel):
             # Do we have more than one option?  Pick one randomly
             if len(self.read_patterns[value]) > 1:
                 logger.debug("Updated to random read pattern.")
-                self.index = random.randint(0,
-                                            len(self.read_patterns[value]) - 1)
+                self.index = random.randint(0, len(self.read_patterns[value]) - 1)
             else:
                 self.index = 0
         else:
             # Value we've never seen, let's just pick one.
-            self.value = random.choice(self.read_patterns.keys())
+            # 修复：转为list避免Python3迭代器报错
+            self.value = random.choice(list(self.read_patterns.keys()))
             self.index = 0
-            logger.debug("Saw a write that we've never seen before (%08X), "
-                           "randomly selected %d." % (value, self.value))
+            logger.debug(
+                "Saw a write that we've never seen before (%08X), randomly selected %d." % (value, self.value)
+            )
         return True
 
     def read(self):
+        """修复：防护空pattern列表，避免索引报错"""
+        if not self.read_patterns.get(self.value, []) or not self.read_patterns[self.value][self.index]:
+            logger.warning("Empty read pattern for value %d, returning 0", self.value)
+            return 0
+        
         idx = self.count % len(self.read_patterns[self.value][self.index])
         logger.debug("Read %d of %d" % (idx, len(self.read_patterns[self.value][self.index])))
         self.count += 1
@@ -89,8 +98,9 @@ class PatternModel(MemoryModel):
 
     def merge(self, other_model):
         if other_model != self:
-            logger.error("Tried to merge two models that aren't the same (%s "
-                         "!= %s)" % (str(other_model), str(self)))
+            logger.error(
+                "Tried to merge two models that aren't the same (%s != %s)" % (str(other_model), str(self))
+            )
             import traceback
             traceback.print_stack()
             logger.exception("A merge failed!  This should impossible!")
@@ -101,8 +111,7 @@ class PatternModel(MemoryModel):
         for value in other_model.read_patterns:
             # Add the pattern from the other
             if value not in self.read_patterns:
-                self.read_patterns[value] = \
-                    other_model.read_patterns[other_model.value]
+                self.read_patterns[value] = other_model.read_patterns[other_model.value]
             else:
                 for pattern in other_model.read_patterns[value]:
                     if pattern not in self.read_patterns[value]:
@@ -118,6 +127,10 @@ class PatternModel(MemoryModel):
         :param log:
         :return:
         """
+        # 防护：空log
+        if not log:
+            logger.warning("Empty log passed to train, returning False")
+            return False
 
         # Only extract our read values
         reads = [x[0] for x in log]
@@ -130,7 +143,6 @@ class PatternModel(MemoryModel):
             # Now let's encode our pattern
             pattern = []
             last = None
-            repeated_value = None
             repeated_count = 0
             for x in read_pattern:
                 if x == last:
@@ -157,33 +169,45 @@ class PatternModel(MemoryModel):
         :param reads:
         :return:
         """
+        # 防护：空列表/单元素列表
+        if not reads:
+            return None
+        if len(reads) == 1:
+            return reads
+
         # Are they all the same?
         all_same = True
         for x in reads:
             if x != reads[0]:
                 all_same = False
+                break  # 优化：找到不同值立即退出循环
         if all_same:
             return [reads[0]]
 
         # Let's see if a repeating pattern exist
-        max_len = len(reads) / 2
-        for seqn_len in range(2, max_len):
+        max_len = len(reads) // 2  # 修复1：整数除法，避免float
+        # 防护：max_len小于2时直接返回原列表（避免range(2,1)无效循环）
+        if max_len < 2:
+            return reads
+        
+        # 修复2：range(2, max_len + 1) 补全边界，覆盖max_len长度检查
+        for seqn_len in range(2, max_len + 1):
+            # 防护：seqn_len*2超过列表长度时跳过（避免切片越界）
+            if 2 * seqn_len > len(reads):
+                continue
 
             # Do the first 2 at least match as a pattern?
             if reads[0:seqn_len] == reads[seqn_len:2 * seqn_len]:
-
                 is_pattern = True
 
-                # Let's check all the others, ignoring any incomplete
-                # patterns at the end
+                # Let's check all the others, ignoring any incomplete patterns at the end
                 last_complete_seqn = len(reads) - len(reads) % seqn_len
                 for y in range(2 * seqn_len, last_complete_seqn, seqn_len):
                     if reads[0:seqn_len] != reads[y:y + seqn_len]:
                         is_pattern = False
                         break
-                remainder = reads[-(len(reads) % seqn_len):]
-                if not all(remainder[i] == reads[i] for i in
-                           range(len(remainder))):
+                remainder = reads[-(len(reads) % seqn_len):] if len(reads) % seqn_len != 0 else []
+                if remainder and not all(remainder[i] == reads[i] for i in range(len(remainder))):
                     is_pattern = False
                 if is_pattern:
                     return reads[0:seqn_len]
@@ -203,9 +227,9 @@ class PatternModel(MemoryModel):
         :param log:
         :return:
         """
-
-        # if len(reads) < 2:
-        #     return False
+        # 防护：空log
+        if not log:
+            return False
 
         # Only extract our read values
         reads = [x[0] for x in log]

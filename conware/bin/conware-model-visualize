@@ -1,16 +1,18 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+# 关键：指定Python3解释器（注释单独换行，不要跟在shebang后面）
 
 # Native
 import argparse
 import fnmatch
 import os
-
 import sys
-
-from networkx.drawing.nx_agraph import to_agraph
-
 import logging
 
+# 第三方库
+import networkx as nx
+from networkx.drawing.nx_agraph import to_agraph
+
+# 项目模块
 from conware.model import ConwareModel
 
 logger = logging.getLogger(__name__)
@@ -33,63 +35,45 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Setup Logging
-    logging.basicConfig()
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=logging.INFO
+    )
     l = logging.getLogger()
     if args.debug:
         l.setLevel(logging.DEBUG)
     else:
         l.setLevel(logging.INFO)
 
-    # if not os.path.exists(args.recording_dir):
-    #     parser.print_help()
-    #     sys.exit(0)
-
-    # model_file = os.path.join(args.recording_dir, G.MODEL_FILE_OPTIMIZED)
+    # 检查模型文件是否存在
     if not os.path.exists(args.model_filename):
         logger.error("Model file (%s) does not exist.", args.model_filename)
         parser.print_help()
-        sys.exit(0)
+        sys.exit(1)
 
-    logger.info("Importing model file (%s)..." % args.model_filename)
-    model = ConwareModel(filename=args.model_filename)
+    try:
+        logger.info("Importing model file (%s)..." % args.model_filename)
+        model = ConwareModel(filename=args.model_filename)
 
-    for peripheral in model.peripherals:
-        # logger.info("Graphing %s..." % str(peripheral.name))
-        # dot = Digraph(comment=str(peripheral))
-        # bfs_graph(dot, peripheral.start_state)
-        # dot.render('test.gv', view=True)
-        #
-        # peripheral.reset()
-        peripheral._label_nodes()
-        logger.info("Graphing %s..." % str(peripheral.name))
-        A = to_agraph(peripheral.graph)
-        A.layout('dot')
-        basename = os.path.splitext(args.model_filename)[0]
-        save_filename = basename + "_" + str(peripheral.name) + '.pdf'
-        logger.info("Saving graph to %s..." % save_filename)
-        A.draw(save_filename)
+        # 遍历外设并生成可视化PDF
+        for peripheral in model.peripherals:
+            peripheral._label_nodes()
+            logger.info("Graphing %s..." % str(peripheral.name))
+            
+            # 生成图形并保存
+            A = to_agraph(peripheral.graph)
+            A.layout('dot')
+            basename = os.path.splitext(args.model_filename)[0]
+            save_filename = f"{basename}_{peripheral.name}.pdf"
+            logger.info("Saving graph to %s..." % save_filename)
+            A.draw(save_filename)
 
-        # if peripheral.name == "UART" or False:
-        #
-        #     # peripheral._label_nodes()
-        #     # A = to_agraph(peripheral.graph)
-        #     # A.layout('dot')
-        #     # A.draw('UART_before.svg')
-        #     # print(peripheral.graph.nodes)
-        #     #
-        #     #
-        #     # peripheral.optimize2()
-        #     A = to_agraph(peripheral.graph)
-        #     A.layout('dot')
-        #     A.draw('UART_optimized.svg')
-        #
-        #     pos = networkx.spring_layout(peripheral.graph, k=.01, iterations=1500)
-        #     networkx.draw(peripheral.graph, pos, with_labels=True, node_size=200, font_size=6)
-        #
-        #     edge_labels = networkx.get_edge_attributes(peripheral.graph, 'r')
-        #     networkx.draw_networkx_edge_labels(peripheral.graph, pos, labels=edge_labels, font_size=6)
+        # 修复Python3 print语法
+        print(model)
 
-        # plt.savefig("graph.pdf")
-        # plt.show()
+    except Exception as e:
+        logger.error(f"Failed to visualize model: {e}", exc_info=True)
+        sys.exit(1)
 
-    print model
+    logger.info("Model visualization completed successfully!")
+    sys.exit(0)
