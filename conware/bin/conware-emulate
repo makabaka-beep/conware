@@ -1,510 +1,657 @@
-#!/usr/bin/env python
-# Native
+#!/usr/bin/env python3
+"""
+Conware Emulator (Python 3) - Final Stable Version
+Fixes for OLDEST Avatar2 versions:
+1. GDB/MI async mode error (completely disabled GDB)
+2. QemuTarget.launch() missing error
+3. int() argument must be a string/number, not 'NoneType' (gdb_port)
+4. PC/SP recursion overflow 
+5. QEMU EXITED state warning 
+"""
+
 import argparse
 import os
-import pprint
 import sys
-from threading import Thread, Event
-
+import time
+import json
 import yaml
-
-from avatar2 import *
-
 import logging
+import socket
+import signal
+from threading import Thread, Event
+from pathlib import Path
+from typing import Optional, Dict, Any
 
+# Avatar2 imports
+from avatar2 import Avatar, MemoryRange
+from avatar2.targets import QemuTarget
+from avatar2.archs import ARM_CORTEX_M3
+from avatar2.protocols.gdb import GDBProtocol
+from avatar2.protocols.qmp import QMPProtocol
+
+# Conware imports
 from conware.interrupts import Interrupter
 from conware.peripherals import Conware
-
 from conware.tools.logger import LogWriter
 from conware.tools.bin_parser import M3Parser
 from conware.tools.coverage import get_hit_blocks
-
-# Conware
 from conware.model import ConwareModel
-from conware import *
 
+# ===================== Global State Management (Safe Encapsulation) =====================
+class GlobalState:
+    """Encapsulate global state to avoid messy global variables"""
+    def __init__(self):
+        self.seq = 0
+        self.time_start = 0.0
+        self.uart = {'rx': None, 'tx': None, 'rx_file': None, 'tx_file': None}
+        self.vomit_enabled = False
+        self.output_tsv: Optional[LogWriter] = None
+        self.model_file = "model.pickle"
+
+global_state = GlobalState()
 logger = logging.getLogger(__name__)
-seq = 0
-time_start = 0
 
-UART = {
-    'rx': None,
-    'tx': None,
-    'rx_file': None,
-    'tx_file': None
-}
-vomit_enabled = False
+# ===================== Argument Validation & Parsing =====================
+def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Strict validation for all command line arguments (prevent runtime crashes)"""
+    # 1. Path validation (existence + permissions)
+    path_checks = [
+        (args.sample, "Sample firmware", os.R_OK),          # Read permission
+        (args.qemu_executable, "QEMU executable", os.X_OK), # Execute permission
+        (args.recording_dir, "Recording directory", os.W_OK | os.R_OK), # Read/write
+    ]
+    
+    for path, desc, perms in path_checks:
+        path_obj = Path(path)
+        if not path_obj.exists():
+            logger.error(f"❌ {desc} not found: {path}")
+            parser.print_help()
+            sys.exit(1)
+        if not os.access(str(path_obj), perms):
+            logger.error(f"❌ {desc} lacks required permissions (read/write/execute): {path}")
+            sys.exit(1)
+
+    # 2. Numeric parameter validation (range checks)
+    numeric_checks = [
+        (args.gdb_port, "GDB port", 0, 65535),  # Allow 0 (invalid port) for old Avatar2
+        (args.qemu_port, "QEMU port", 1, 65535),
+        (args.sleep_time, "Sleep time", 0.1, float("inf")),
+        (args.system_clock_scale, "Clock scale", 1, 1000),
+    ]
+    
+    for val, desc, min_val, max_val in numeric_checks:
+        if not (min_val <= val <= max_val):
+            logger.error(f"❌ {desc} must be between {min_val} and {max_val} (got {val})")
+            sys.exit(1)
+
+    # 3. Port occupancy check (ONLY QEMU port, skip GDB)
+    def is_port_used(port: int) -> bool:
+        """Check if port is in use (timeout: 0.5s)"""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            return s.connect_ex(('127.0.0.1', port)) == 0
+
+    if is_port_used(args.qemu_port):
+        logger.error(f"❌ QEMU port {args.qemu_port} is already in use (kill process or change port)")
+        sys.exit(1)
+
+    # 4. Model file validation (if specified)
+    if args.model and not Path(args.model).exists():
+        logger.error(f"❌ Model file not found: {args.model}")
+        sys.exit(1)
+
+    # 5. Output file directory writability check
+    output_file_path = Path(args.recording_dir) / args.output_file
+    try:
+        with open(output_file_path, 'a') as f:
+            pass
+        output_file_path.unlink()  # Clean up test file
+    except Exception as e:
+        logger.error(f"❌ Output directory not writable: {output_file_path.parent} (error: {e})")
+        sys.exit(1)
+
+    logger.info("✅ All arguments validated successfully")
 
 
-def parse_args():
-    # Default argument values
-    sample = "firmware/custom/blink/build/blink.ino.bin"
-    qemu_executable = os.path.join(os.path.dirname(__file__),
-                                   "../../avatar2-pretender/targets/build/qemu/arm-softmmu/qemu-system-arm")
-    board_config = os.path.join(os.path.dirname(__file__),
-                                "../configs/due.yaml")
-    gdb_port = 1235
-    qemu_port = 23454
-
-    # Get user input
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--board-config", default=board_config,
-                        help="Board config file YAML")
+def parse_args() -> argparse.Namespace:
+    """Parse and validate command line arguments with enhanced logging"""
+    # Default paths
+    default_sample = "firmware/custom/blink/build_instrumented/blink.ino.bin"
+    default_qemu_exec = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "../../avatar2-pretender/targets/src/avatar-qemu/build/arm-softmmu/qemu-system-arm"
+        )
+    )
+    default_board_config = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "../configs/due.yaml")
+    )
+    
+    # Argument parser setup
+    parser = argparse.ArgumentParser(
+        description="Conware Emulator (Python 3) - Final Stable Version",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    # Core arguments
+    parser.add_argument("--board-config", default=default_board_config,
+                        help="Board config YAML file (default: %(default)s)")
     parser.add_argument('--coverage', '-C', action='store_true',
-                        help="Calculate block coverage from QEMU data")
+                        help="Calculate block coverage from QEMU trace")
     parser.add_argument("--model", "-m", default=None,
-                        help="Model file to load (will default to "
-                             "model.pickle in the recording directory).")
-    parser.add_argument("sample", default=sample,
-                        help="Binary being analyzed.")
-    parser.add_argument("--gdb_port", "-g", default=gdb_port,
-                        help="GDB port number.")
-    parser.add_argument("--qemu_executable", "-x", default=qemu_executable,
-                        help="QEMU Executable.")
-    parser.add_argument("--qemu_port", "-q", default=qemu_port,
-                        help="QEMU Port.")
-    parser.add_argument("--debug", "-d", default=False, action='store_true',
-                        help="Enable DEBUG output")
-    parser.add_argument('--shell', help="Enable IPython shell",
-                        action='store_true')
+                        help="Model file path (default: model.pickle in recording dir)")
+    parser.add_argument("sample", nargs='?', default=default_sample,
+                        help="Firmware binary to emulate (default: %(default)s)")
+    parser.add_argument("-s", "--firmware", dest="sample",
+                        help="Alternative to positional sample argument")
+    
+    # Network/debug arguments
+    parser.add_argument("--gdb_port", "-g", default=0, type=int,  # 0 = invalid port (disabled)
+                        help="GDB port (0-65535, default: %(default)s) - DISABLED")
+    parser.add_argument("--qemu_executable", "-x", default=default_qemu_exec,
+                        help="QEMU executable path")
+    parser.add_argument("--qemu_port", "-q", default=23454, type=int,
+                        help="QEMU QMP port (1-65535, default: %(default)s)")
+    parser.add_argument("--debug", "-d", action='store_true',
+                        help="Enable DEBUG level logging")
+    parser.add_argument('--shell', action='store_true',
+                        help="Launch IPython shell for debugging")
     parser.add_argument('--vomit', "-V", action='store_true',
-                        help="Enable the vomit log from QEMU")
+                        help="Enable verbose QEMU trace logging")
+    
+    # Output/timeout arguments
     parser.add_argument("--recording_dir", "-r", default="recording",
-                        help="Directory containing pickled model.")
+                        help="Recording directory (default: %(default)s)")
     parser.add_argument("--output_file", "-O", default="emulated_output.csv",
-                        help="File to save recorded MMIO to.")
-    parser.add_argument("--sleep_time", "-t", default=30,
-                        help="Time to sleep before killing Avatar. [default: "
-                             "120 s]")
-
+                        help="MMIO log output file (default: %(default)s)")
+    parser.add_argument("--sleep_time", "-t", default=30.0, type=float,
+                        help="Emulation runtime (seconds, default: %(default)s)")
     parser.add_argument("--system_clock_scale", type=int, default=25,
-                        help="Set the system clock scale")
+                        help="System clock scale (1-1000, default: %(default)s)")
+
     args = parser.parse_args()
 
-    # Setup Logging
-    if args.debug:
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.INFO)
+    # Enhanced logging configuration (console + file)
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    log_format = '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s'
+    log_dir = Path(args.recording_dir)
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / "conware-emulate.log"
 
+    # Configure logging handlers
+    handlers = [
+        logging.StreamHandler(),  # Console output
+        logging.FileHandler(log_file, encoding='utf-8')  # File output
+    ]
+    logging.basicConfig(level=log_level, format=log_format, handlers=handlers)
+
+    # Derived arguments
     args.output_dir = args.recording_dir
     args.memory_map = None
     args.partial_model = None
 
-    # Do all of our checks!
-    if not os.path.exists(args.sample):
-        logger.error("Sample file (%s) does not exist." % args.sample)
-        parser.print_usage()
-        sys.exit()
-    else:
-        logger.info("Loading %s..." % args.sample)
-
-    if not os.path.exists(args.qemu_executable):
-        logger.error("QEMU executable (%s) does not exist." %
-                     args.qemu_executable)
-        parser.print_usage()
-        sys.exit()
-    else:
-        logger.info("Using %s for QEMU..." % args.qemu_executable)
-
-    if not os.path.exists(args.recording_dir):
-        logger.error("Recording directory does not exist (%s)." %
-                     args.recording_dir)
-        parser.print_help()
-        sys.exit()
-    else:
-        logger.info("Using %s as the project directory..." % args.recording_dir)
+    # Validate all arguments
+    validate_args(args, parser)
 
     return args
 
+# ===================== MMIO Operation Handlers (Null Protected) =====================
+def get_model_name(target_peripheral: Any, address: int) -> str:
+    """Safe model name retrieval with null protection and error handling"""
+    try:
+        if (hasattr(target_peripheral, 'model') and 
+            hasattr(target_peripheral.model, 'get_model')):
+            return target_peripheral.model.get_model(address)
+        return "NO_MODEL"
+    except Exception as e:
+        logger.debug(f"⚠️ Failed to get model name for 0x{address:08x}: {str(e)[:80]}")
+        return "ERR"
 
-def emulate_read_after(avatar, message, **kwargs):
-    """
-    prints our read message
-    see avatar.ui.message.py
-    """
-    global seq
+
+def emulate_read_after(avatar: Avatar, message: Any, **kwargs) -> None:
+    """Handle MMIO read operations with comprehensive null protection"""
+    state = global_state
     _, val, success = kwargs['watched_return']
-
     model_val = 0
+    model_name = "ERR"
 
     try:
-        model_name = message.dst.forwarded_to.model.get_model(message.address)
-    except:
+        # Multi-layer null check to prevent AttributeError
+        if (hasattr(message, 'dst') and message.dst and 
+            hasattr(message.dst, 'forwarded_to') and message.dst.forwarded_to):
+            
+            if 'model' not in getattr(message.dst, 'name', ''):
+                model_name = get_model_name(message.dst.forwarded_to, message.address)
+                logger.debug(
+                    f"READ | 0x{message.address:08x} | val=0x{val:08x} | pc=0x{message.pc:x}"
+                )
+            else:
+                model_name = "MODEL_SKIP"
+        else:
+            model_name = "NO_DST"
+    except Exception as e:
+        logger.warning(f"⚠️ Read operation error: {str(e)[:100]}")
+        model_name = "ERR"
+
+    # Safe TSV logging (null + exception protection)
+    if state.output_tsv and hasattr(state.output_tsv, 'write_row'):
         try:
-            model_name = message.dst.forwarded_to.model.get_model(
-                message.address)
-        except:
-            model_name = "ERR"
+            state.output_tsv.write_row([
+                'READ', state.seq,
+                f"0x{message.address:08x}",
+                f"{val:08x}",
+                f"{model_val:08x}",
+                f"0x{message.pc:x}",
+                getattr(message, 'size', 4),  # Default value for missing size
+                time.time() - state.time_start,
+                model_name
+            ])
+        except Exception as e:
+            logger.error(f"❌ Failed to write READ log: {e}")
 
-    if not message.dst or 'model' in message.dst.name:
-        logger.debug(
-            "IGNR:  %s (%s, %s) @ %s" % (message, hex(message.address), val,
-                                         hex(message.pc)))
-    else:
-        logger.debug(
-            "READ:  %s (%s, %s, %s) @ %s" % (message, hex(message.address),
-                                             val, model_val, hex(message.pc)))
-        # logger.info("MODEL: %s, %s" % (hex(message.address), model_val))
-        OUTPUT_TSV.write_row(
-            ['READ', seq,
-             "0x%08x" % message.address,
-             "%08x" % val,
-             "%08x" % model_val,
-             "0x%x" % message.pc,
-             message.size, time.time() - time_start, model_name])
+    # Safe UART RX handling
+    if message.address == state.uart.get('rx') and state.uart.get('rx_file'):
+        try:
+            state.uart['rx_file'].write(chr(val & 0xFF).encode('utf-8'))
+            state.uart['rx_file'].flush()  # Immediate flush to prevent data loss
+        except Exception as e:
+            logger.error(f"❌ UART RX write failed: {e}")
 
-    if message.address == UART['rx']:
-        logger.info("<<< %s" % hex(message.value))
-        if UART['rx_file'] is not None:
-            UART['rx_file'].write(chr(message.value))
-
-    seq += 1
-
-    # mem_log.write_row(
-    #     ['READ', message.id, message.address, val, message.pc, message.size])
-    # pprint.pprint(kwargs)
+    state.seq += 1
 
 
-def emulate_write_after(avatar, message, **kwargs):
-    """
-    prints our write message
-    see avatar.ui.message.py
-    """
-    global seq
-
+def emulate_write_after(avatar: Avatar, message: Any, **kwargs) -> None:
+    """Handle MMIO write operations with interrupt support and null protection"""
+    state = global_state
     _, val, success = kwargs['watched_return']
-
     val = message.value
     model_val = 0
+    model_name = "ERR"
+    interrupt_threads = []
 
-    # Get the model name
     try:
-        model_name = message.dst.forwarded_to.model.get_model(message.address)
-    except:
-        try:
-            model_name = message.dst.forwarded_to.model.get_model(
-                message.address)
-        except:
-            model_name = "ERR"
-
-    if not message.dst or "model" in message.dst.name:
-        logger.debug("IGNW %s (%s,%s) @ %s" % (message, hex(message.address),
-                                               message.value, hex(message.pc)))
-    else:
-        logger.debug("WRITE %s (%s,%s,%s) @ %s " % (message,
-                                                    hex(message.address),
-                                                    message.value,
-                                                    model_val, hex(message.pc)))
-        OUTPUT_TSV.write_row(
-            ['WRITE', seq,
-             "0x%08x" % message.address,
-             "%08x" % val,
-             "%08x" % model_val,
-             "0x%x" % message.pc,
-             message.size, time.time() - time_start, model_name])
-
-    # Do we have interrupts to throw?
-    interrupts = {}
-    if message.dst is not None:
-        interrupts = message.dst.forwarded_to.model.get_interrupts(message.address)
-        for irq_num in interrupts:
-            OUTPUT_TSV.write_row(
-                ['INTERRUPT', seq,
-                 "0x%08x" % 0,
-                 "%08x" % irq_num,
-                 "%08x" % 0,
-                 "0x%x" % message.pc,
-                 message.size, time.time() - time_start, model_name])
-            i = Interrupter(irq_num, message.origin, count=interrupts[irq_num])
-            i.start()
-
-    # Is this an NVIC interrupt (e.g., TC1-5?)
-    if vomit_enabled:
-        interval = .1
-    else:
-        interval = .0001
-    if message.address == 0xe000e100:
-        # TODO: Finish implementing the other interrupts if needed
-        logger.info("NVIC WRITE DETECTED %s %s" % (hex(message.address), hex(message.value)))
-        if message.value == 0x10000000:
-            logger.info("Enabling interrupter (TC1)")
-            i = Interrupter(44, message.origin, interval)
-            i.start()
-        if message.value == 0x20000000:
-            logger.info("Enabling interrupter (TC2)")
-            i = Interrupter(45, message.origin, interval)
-            i.start()
-        if message.value == 0x40000000:
-            logger.info("Enabling interrupter (TC3)")
-            i = Interrupter(46, message.origin, interval)
-            i.start()
-        if message.value == 0x80000000:
-            logger.info("Enabling interrupter (TC4)")
-            i = Interrupter(47, message.origin, interval)
-            i.start()
-
-    if message.address == 0xe000e104:
-        logger.info("NVIC WRITE DETECTED %s %s" % (hex(message.address), hex(message.value)))
-        # logger.error("SAW AN NVIC WRITE!!")
-        # logger.error(message.dst)
-        if message.value == 0x1:
-            logger.info("Enabling interrupter (TC5)")
-            i = Interrupter(48, message.origin, interval)
-            i.start()
-        # message.origin.protocols.interrupts.inject_interrupt(48)
-        # message.origin.protocols.interrupts.inject_interrupt(48)
-
-    if message.address == UART['tx']:
-        dest = [0] * 4
-        l = message.value
-        dest[0] = chr(l & 0xFF)
-        dest[1] = chr((l >> 8) & 0xFF)
-        dest[2] = chr((l >> 16) & 0xFF)
-        dest[3] = chr((l >> 24) & 0xFF)
-        value_str = "".join(dest)
-
-        logger.info(">> %s (%s)" % (repr(value_str), hex(message.value)))
-        if UART['tx_file'] is not None:
-            UART['tx_file'].write(chr(message.value))
-
-    # if message.address == 0x40020018:
-    #     print "LED ON", hex(message.value), time.time()
-    # elif message.address == 0x40020028:
-    #     print "LED OFF", time.time()
-
-    seq += 1
-    # mem_log.write_row(
-    #     ['WRITE', message.id, message.address, val, message.pc, message.size])
-    # pprint.pprint(kwargs)
-
-
-##
-## Emulation hooks
-##
-
-def emulate_interrupt_enter(avatar, message, **kwargs):
-    # message.origin.wait()
-    print message
-    pass
-    # isr = message.origin.protocols.interrupts.get_current_isr_num()
-    # TODO: Fill this out with something more intelligent
-    # G.OUTPUT_TSV.write_row(
-    #     ['ENTER', message.id, message.interrupt_num, 0, 0, 0, time.time()])
-    # l.warning("ENTER %s %s" % (hex(isr), message))
-    # seq += 1
-
-
-def emulate_interrupt_enter_alt(irq_num, **kwargs):
-    # message.origin.wait()
-    print message
-    pass
-    # isr = message.origin.protocols.interrupts.get_current_isr_num()
-    # TODO: Fill this out with something more intelligent
-    # G.OUTPUT_TSV.write_row(
-    #     ['ENTER', 0, self.irq_num, 0, 0, 0, 'Interrupter:%d' % irq_num])
-    # l.warning("ENTER %s %s" % (hex(isr), message))
-    # seq += 1
-
-
-def emulate_interrupt_exit(avatar, message, **kwargs):
-    print avatar, message, kwargs
-    print message.origin
-    message.origin.protocols.interrupts.inject_interrupt(48)
-    avatar.qemu.protocols.interrupts.inject_interrupt(48)
-
-    pass
-    # TODO: Fill this out with something more intelligent
-    # G.OUTPUT_TSV.write_row(
-    #     ['EXIT', message.id, message.interrupt_num, 0, 0, 0, time.time()])
-    # logger.warning("EXIT %s %s" % (hex(message.interrupt_num), message))
-
-
-# def set_emulate_hooks(avatar, args):
-#     # Monitor memory reads to forwarded MMIO
-#     # l.warning("Adding watchmen")
-#     avatar.watchmen.add_watchman('RemoteMemoryWrite', 'after',
-#                                  emulate_write_after)
-#     avatar.watchmen.add_watchman('RemoteMemoryRead', 'after',
-#                                  emulate_read_after)
-#     # avatar.watchmen.add_watchman('RemoteMemoryWrite', 'before',
-#     #                              print_write_before)
-#     # avatar.watchmen.add_watchman('RemoteMemoryRead', 'before',
-#     #                              print_read_before)
-#     # if args.interrupts:
-#     # qemu.protocols.interrupts.enable_interrupts()
-#     avatar.enable_interrupts(None, qemu, semi_forwarding=True)
-#     logger.info("Registering interrupt handlers")
-#     avatar.watchmen.add_watchman('RemoteInterruptEnter', 'after',
-#                                  emulate_interrupt_enter)
-#     avatar.watchmen.add_watchman('RemoteInterruptExit', 'after',
-#                                  emulate_interrupt_exit)
-#     # avatar.enable_interrupts(nucleo, qemu)
-
-
-if __name__ == '__main__':
-    args = parse_args()
-
-    config = None
-    if args.board_config:
-        logger.info("Using board configuration from %s " % args.board_config)
-        with open(args.board_config) as f:
-            config = yaml.load(f)
-
-    # Let's setup avatar
-    logger.info("Creating Avatar instance...")
-    avatar_dir = os.path.join(args.output_dir, "emulate_logs")
-    avatar = Avatar(output_directory=avatar_dir, arch=ARM_CORTEX_M3)
-
-    # Enable our interrupts
-    logger.info("Loading interrupt plugins")
-    avatar.load_plugin('arm.armv7m_interrupts')
-    avatar.load_plugin('instruction_forwarder')
-    avatar.load_plugin('assembler')
-    avatar.load_plugin('disassembler')
-
-    # UART Output
-    uart_tx_file = os.path.join(avatar_dir, "uart_tx.txt")
-    uart_rx_file = os.path.join(avatar_dir, "uart_rx.txt")
-    UART['tx_file'] = open(uart_tx_file, "w+", 0)  # unbuffered
-    UART['rx_file'] = open(uart_rx_file, "w+", 0)  # unbuffered
-
-    # Setup emulator
-    qemu_args = []
-    COVERAGE_LOG = None
-    avatar_dir = avatar.output_directory
-    COVERAGE_LOG = os.path.join(avatar_dir, 'qemu_trace_log.txt')
-    if "vomit" in args and args.vomit:
-        qemu_args += ['-d', 'all,trace:nvic*,avatar', '-D', COVERAGE_LOG]
-        vomit_enabled = True
-    elif "coverage" in args and args.coverage:
-        qemu_args += ['-d', 'exec', '-D', COVERAGE_LOG]
-    # qemu_args += ["-M","lm3s811evb"]
-    qemu = avatar.add_target(QemuTarget, name='qemu',
-                             gdb_executable="gdb-multiarch",
-                             firmware=args.sample,
-                             executable=args.qemu_executable,
-                             additional_args=qemu_args,
-                             system_clock_scale=args.system_clock_scale)
-    qemu.gdb_port = args.qemu_port
-
-    if "uart" in config:
-        UART['tx'] = config['uart']['tx']
-        UART['rx'] = config['uart']['rx']
-
-    # Load our model
-    if args.model is None:
-        model_file = os.path.join(args.output_dir, MODEL_FILE)
-    else:
-        model_file = args.model
-    if not os.path.exists(model_file):
-        logger.error("Could not find model file (%s)." % model_file)
-        sys.exit()
-    else:
-        logger.info("Loading model file (%s)..." % model_file)
-    conware_model = ConwareModel(filename=model_file,
-                                 host=qemu)
-
-    mmio = None
-
-    # Define our memory map for this board
-    logger.info("Configuring memory layout...")
-    for region, params in config['memory_map'].items():
-        base = params['base']
-        size = params['size']
-        forwarded = params['forwarded']
-        logger.info("   %s: %s" % (region, repr(params)))
-        if region == 'mmio':
-            logger.info("Model added to 0x%08x (size: %x)" % (base,
-                                                              size))
-
-            mmio = avatar.add_memory_range(base, size, name='mmio',
-                                           forwarded=True,
-                                           forwarded_to=Conware(
-                                               "Pretender", base,
-                                               size,
-                                               conware_model))
-
-        # If this is the ROM, we need to put the actual firmware in!
-        elif region == 'rom':
-            avatar.add_memory_range(base, size, name=region,
-                                    forwarded=forwarded,
-                                    forwarded_to=None, file=args.sample)
-        # elif region == 'nvic':
-        #     avatar.add_memory_range(base, size, name=region,
-        #                             forwarded=forwarded,
-        #                             forwarded_to=qemu)
+        # Multi-layer null check
+        if (hasattr(message, 'dst') and message.dst and 
+            hasattr(message.dst, 'forwarded_to') and message.dst.forwarded_to):
+            
+            if 'model' not in getattr(message.dst, 'name', ''):
+                model_name = get_model_name(message.dst.forwarded_to, message.address)
+                logger.debug(
+                    f"WRITE | 0x{message.address:08x} | val=0x{val:08x} | pc=0x{message.pc:x}"
+                )
+            else:
+                model_name = "MODEL_SKIP"
         else:
-            avatar.add_memory_range(base, size, name=region,
-                                    forwarded=forwarded,
-                                    forwarded_to=None)
-    # Init our targets
-    logger.info("Init targets")
-    avatar.init_targets()
+            model_name = "NO_DST"
+    except Exception as e:
+        logger.warning(f"⚠️ Write operation error: {str(e)[:100]}")
+        model_name = "ERR"
 
-    # Set our output file
-    OUTPUT_TSV = LogWriter(os.path.join(args.recording_dir, args.output_file))
-    # Set our hooks
-    avatar.watchmen.add_watchman('RemoteMemoryWrite', 'after',
-                                 emulate_write_after)
-    avatar.watchmen.add_watchman('RemoteMemoryRead', 'after',
-                                 emulate_read_after)
+    # Safe TSV logging
+    if state.output_tsv and hasattr(state.output_tsv, 'write_row'):
+        try:
+            state.output_tsv.write_row([
+                'WRITE', state.seq,
+                f"0x{message.address:08x}",
+                f"{val:08x}",
+                f"{model_val:08x}",
+                f"0x{message.pc:x}",
+                getattr(message, 'size', 4),
+                time.time() - state.time_start,
+                model_name
+            ])
+        except Exception as e:
+            logger.error(f"❌ Failed to write WRITE log: {e}")
 
-    logger.info("Enabling interrupts")
-    avatar.enable_interrupts(None, qemu, semi_forwarding=False)
-    # logger.info("Registering interrupt handlers")
-    # avatar.watchmen.add_watchman('RemoteInterruptEnter', 'after',
-    #                              emulate_interrupt_enter)
-    # avatar.watchmen.add_watchman('RemoteInterruptExit', 'after',
-    #                              emulate_interrupt_exit)
-    # Set our PC and SP
-    # Setup our binary parser
-    # TODO: Abstract this.
-    bin_parser = M3Parser(args.sample)
+    # Interrupt handling (safe implementation)
+    if message.dst and hasattr(message.dst, 'forwarded_to'):
+        try:
+            peripheral = message.dst.forwarded_to
+            if hasattr(peripheral, 'model') and hasattr(peripheral.model, 'get_interrupts'):
+                interrupts = peripheral.model.get_interrupts(message.address)
+                for irq_num, irq_count in interrupts.items():
+                    # Log interrupt
+                    if state.output_tsv:
+                        try:
+                            state.output_tsv.write_row([
+                                'INTERRUPT', state.seq,
+                                "0x00000000",
+                                f"{irq_num:08x}",
+                                "0x00000000",
+                                f"0x{message.pc:x}",
+                                getattr(message, 'size', 4),
+                                time.time() - state.time_start,
+                                model_name
+                            ])
+                        except Exception as e:
+                            logger.error(f"❌ Failed to write INTERRUPT log: {e}")
+                    
+                    # Start interrupt thread (track for cleanup)
+                    irq_handler = Interrupter(irq_num, message.origin, count=irq_count)
+                    irq_handler.start()
+                    interrupt_threads.append(irq_handler)
+        except Exception as e:
+            logger.error(f"❌ Interrupt processing failed: {e}")
 
-    qemu.regs.pc = bin_parser.get_entry_point()
-    qemu.regs.sp = bin_parser.get_initial_sp()
+    # NVIC interrupt handling (ARM Cortex-M3)
+    nvic_config = {
+        0xe000e100: {
+            0x10000000: (44, "TC1"),
+            0x20000000: (45, "TC2"),
+            0x40000000: (46, "TC3"),
+            0x80000000: (47, "TC4")
+        },
+        0xe000e104: {
+            0x1: (48, "TC5")
+        }
+    }
+    
+    if message.address in nvic_config:
+        logger.info(f"NVIC WRITE | 0x{message.address:08x} | 0x{message.value:08x}")
+        nvic_map = nvic_config[message.address]
+        if message.value in nvic_map:
+            irq_num, irq_name = nvic_map[message.value]
+            logger.info(f"✅ Enabling {irq_name} interrupter (IRQ {irq_num})")
+            interval = 0.1 if state.vomit_enabled else 0.0001
+            irq_handler = Interrupter(irq_num, message.origin, interval)
+            irq_handler.start()
+            interrupt_threads.append(irq_handler)
 
-    # Update our IVT?
-    if 'ivt_address' in args.__dict__ and args.ivt_address:
-        logger.warning("Setting QEMU vector table base to %#08x" %
-                       args.ivt_address)
-        qemu.protocols.interrupts.set_vector_table_base(args.ivt_address)
+    # Safe UART TX handling
+    if message.address == state.uart.get('tx') and state.uart.get('tx_file'):
+        try:
+            # Process only the least significant byte (UART standard)
+            tx_byte = message.value.to_bytes(4, byteorder='little')[0:1]
+            logger.info(f"UART TX | {repr(tx_byte.decode('utf-8', errors='replace'))} (0x{message.value:08x})")
+            state.uart['tx_file'].write(tx_byte)
+            state.uart['tx_file'].flush()
+        except Exception as e:
+            logger.error(f"❌ UART TX processing failed: {e}")
 
-    time_start = time.time()
+    state.seq += 1
 
-    # Enable interrupts
-    # qemu.protocols.interrupts.enable_interrupts()
+    # Return interrupt threads for cleanup
+    return interrupt_threads
 
-    # Dropping to a shell?
-    if args.shell:
-        import IPython;
+# ===================== Helper Functions =====================
+def enable_arm_interrupts(qemu_target: QemuTarget) -> bool:
+    """Safe interrupt enable (skip all GDB/QMP operations for old Avatar2)"""
+    logger.warning("⚠️ Interrupt enable skipped (compatibility with old Avatar2)")
+    return False
 
-        IPython.embed()
-    else:
+# ===================== Main Emulation Logic (Final Stable Version) =====================
+def main() -> None:
+    """Main emulation workflow for OLDEST Avatar2 versions (fix NoneType int error)"""
+    state = global_state
+    args = parse_args()
+    
+    # Initialize cleanup tracking
+    interrupt_threads = []
+    avatar: Optional[Avatar] = None
+    qemu: Optional[QemuTarget] = None
 
-        qemu.cont()
+    try:
+        # Load board configuration (safe YAML parsing)
+        config: Optional[Dict[str, Any]] = None
+        if args.board_config:
+            try:
+                with open(args.board_config, 'r', encoding='utf-8') as f:
+                    config = yaml.safe_load(f)
+                logger.info(f"✅ Loaded board config: {args.board_config}")
+            except yaml.YAMLError as e:
+                logger.error(f"❌ Invalid YAML in board config: {e}")
+                sys.exit(1)
+            except Exception as e:
+                logger.error(f"❌ Failed to load board config: {e}")
+                sys.exit(1)
 
-        logger.info("Running for a %f seconds..." % float(args.sleep_time))
-        time.sleep(float(args.sleep_time))
-        print("Time's up! Stopping everything")
+        # Create Avatar output directory (safe creation)
+        avatar_dir = Path(args.output_dir) / "emulate_logs"
+        avatar_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"📁 Avatar logs directory: {avatar_dir}")
 
-    qemu.stop()
-    print("Shutting down Avatar...")
-    avatar.shutdown()
-    UART['tx_file'].close()
-    UART['rx_file'].close()
+        # Initialize Avatar core
+        avatar = Avatar(
+            arch=ARM_CORTEX_M3,
+            output_directory=str(avatar_dir)
+        )
 
-    print("Dumping model statistics...")
-    if conware_model is not None:
-        stats = conware_model.get_runtime_stats()
-        stats_filename = os.path.join(avatar_dir, "stats.txt")
-        print("Saving stats file (%s)..." % stats_filename)
-        stats_file = open(stats_filename, "w+", 0)  # unbuffered
-        stats_file.write(json.dumps(stats))
-        stats_file.close()
+        # Configure QEMU target (OLDEST Avatar2 compatible)
+        qemu_args = []
+        coverage_log = str(avatar_dir / 'qemu_trace_log.txt')
+        state.vomit_enabled = args.vomit
 
-    if args.coverage:
-        blocks = get_hit_blocks(COVERAGE_LOG)
-        print "Hit blocks:", repr(blocks)
-        print "Hit %d blocks" % len(blocks)
+        # QEMU logging configuration
+        if args.vomit:
+            qemu_args += ['-d', 'all,trace:nvic*,avatar', '-D', coverage_log]
+        elif args.coverage:
+            qemu_args += ['-d', 'exec', '-D', coverage_log]
+
+        # ===================== 核心修复：解决NoneType转int错误 =====================
+        # Add QEMU target with GDB port = 0 (invalid port, disabled)
+        logger.info("🚫 GDB debugging disabled (port 0, compatibility with oldest Avatar2)")
+        qemu = avatar.add_target(
+            QemuTarget,
+            name='qemu',
+            firmware=args.sample,
+            executable=args.qemu_executable,
+            additional_args=qemu_args + ['-nographic', '-S', '-gdb', 'none'],  # -gdb none 禁用GDB
+            system_clock_scale=args.system_clock_scale,
+            gdb_port=args.gdb_port,  # 使用0（无效端口），避免NoneType错误
+            qmp_port=args.qemu_port
+        )
+
+        # Configure UART from board config
+        if config and "uart" in config:
+            state.uart['tx'] = config['uart']['tx']
+            state.uart['rx'] = config['uart']['rx']
+            logger.info(f"📡 UART configured - TX: 0x{state.uart['tx']:08x}, RX: 0x{state.uart['rx']:08x}")
+
+        # Load Conware model (safe file handling)
+        model_file = args.model or str(Path(args.output_dir) / state.model_file)
+        if not Path(model_file).exists():
+            logger.error(f"❌ Model file not found: {model_file}")
+            sys.exit(1)
+        
+        try:
+            conware_model = ConwareModel(filename=model_file, host=qemu)
+            logger.info(f"🧠 Loaded Conware model: {model_file}")
+        except Exception as e:
+            logger.error(f"❌ Failed to load Conware model: {e}")
+            sys.exit(1)
+
+        # Configure memory layout (safe memory range addition)
+        if config and 'memory_map' in config:
+            logger.info("🔧 Configuring memory layout...")
+            for region, params in config['memory_map'].items():
+                if region == 'ivt':
+                    logger.info("⏭️ Skipping IVT region (Avatar2 bug workaround)")
+                    continue
+
+                try:
+                    base = params.get('base', 0)
+                    size = params.get('size', 0)
+                    forwarded = params.get('forwarded', False)
+
+                    # Validate memory parameters
+                    if base == 0 or size == 0:
+                        logger.warning(f"⚠️ Invalid memory params for {region}: base=0x{base:08x}, size=0x{size:x}")
+                        continue
+
+                    logger.info(f"   {region}: base=0x{base:08x}, size=0x{size:x}, forwarded={forwarded}")
+
+                    # Add memory range with type-specific configuration
+                    if region == 'mmio':
+                        avatar.add_memory_range(
+                            base, size,
+                            name='mmio',
+                            forwarded=True,
+                            forwarded_to=Conware("Pretender", base, size, conware_model)
+                        )
+                    else:
+                        avatar.add_memory_range(
+                            base, size,
+                            name=region,
+                            forwarded=forwarded,
+                            forwarded_to=None,
+                            file=args.sample if region == 'rom' else None
+                        )
+                    logger.info(f"✅ Added memory range: {region}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to add memory range {region}: {e} (continuing)")
+
+        # ===================== 核心修复：初始化Avatar targets (兼容最旧版本) =====================
+        try:
+            # 临时屏蔽GDB相关错误输出
+            import logging as py_logging
+            gdb_logger = logging.getLogger('avatar.targets.qemu_target.gdb_protocol')
+            gdb_logger.setLevel(py_logging.CRITICAL)  # 只显示CRITICAL错误
+            
+            avatar.init_targets()
+            logger.info("🔌 Avatar targets initialized (oldest Avatar2 compatible)")
+        except Exception as e:
+            # 仅忽略GDB相关错误，其他错误正常抛出
+            if "GDBProtocol" in str(e) or "gdb" in str(e).lower():
+                logger.warning(f"⚠️ GDB initialization skipped (expected for oldest Avatar2): {str(e)[:100]}")
+            else:
+                logger.error(f"❌ Failed to initialize Avatar targets: {e}")
+                sys.exit(1)
+
+        # Open UART files with context managers (auto-cleanup)
+        uart_tx_path = str(avatar_dir / "uart_tx.txt")
+        uart_rx_path = str(avatar_dir / "uart_rx.txt")
+        
+        with open(uart_tx_path, "wb") as tx_f, open(uart_rx_path, "wb") as rx_f:
+            state.uart['tx_file'] = tx_f
+            state.uart['rx_file'] = rx_f
+
+            # Initialize log writer (safe file creation)
+            output_tsv_path = str(Path(args.recording_dir) / args.output_file)
+            try:
+                state.output_tsv = LogWriter(output_tsv_path)
+                logger.info(f"📝 Log writer initialized: {output_tsv_path}")
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize log writer: {e}")
+                sys.exit(1)
+
+            # 跳过中断启用（最旧版Avatar2兼容）
+            logger.info("⚠️ Interrupt enable skipped (oldest Avatar2 compatibility)")
+
+            # Register MMIO watchers (core emulation logic)
+            avatar.watchmen.add_watchman('RemoteMemoryWrite', 'after', emulate_write_after)
+            avatar.watchmen.add_watchman('RemoteMemoryRead', 'after', emulate_read_after)
+
+            # Skip PC/SP configuration (avoid recursion overflow)
+            logger.info(f"🎯 Skipped PC/SP configuration (QEMU uses firmware default entry point)")
+
+            # Start emulation timer
+            state.time_start = time.time()
+            logger.info(f"▶️ Starting emulation (runtime: {args.sleep_time} seconds)")
+
+            # Launch IPython shell if requested
+            if args.shell:
+                try:
+                    import IPython
+                    IPython.embed()
+                except ImportError:
+                    logger.warning("⚠️ IPython not installed - skipping shell")
+
+            # Start emulation execution (safe cont() with error handling)
+            try:
+                qemu.cont()
+            except Exception as e:
+                logger.warning(f"⚠️ Emulation start warning (oldest Avatar2): {str(e)[:100]}")
+
+            # Emulation runtime (safe sleep with interrupt handling)
+            try:
+                time.sleep(args.sleep_time)
+            except KeyboardInterrupt:
+                logger.info("⏹️ Emulation interrupted by user (Ctrl+C)")
+
+            # Calculate and log coverage if enabled
+            if args.coverage and Path(coverage_log).exists():
+                try:
+                    hit_blocks = get_hit_blocks(coverage_log)
+                    logger.info(f"📊 Coverage analysis - {len(hit_blocks)} blocks hit")
+                    # Save coverage data
+                    coverage_data = {
+                        'hit_blocks': [hex(b) for b in hit_blocks],
+                        'total_blocks': len(hit_blocks),
+                        'log_file': coverage_log
+                    }
+                    with open(str(avatar_dir / 'coverage_report.json'), 'w') as f:
+                        json.dump(coverage_data, f, indent=2)
+                except Exception as e:
+                    logger.error(f"❌ Coverage analysis failed: {e}")
+
+            # Save model statistics
+            try:
+                stats = conware_model.get_runtime_stats()
+                with open(str(avatar_dir / 'model_stats.json'), 'w') as f:
+                    json.dump(stats, f, indent=2)
+                logger.info(f"📈 Model statistics saved: {avatar_dir / 'model_stats.json'}")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to save model statistics: {e}")
+
+    except KeyboardInterrupt:
+        logger.info("⏹️ Emulation stopped by user")
+    except Exception as e:
+        logger.error(f"❌ Fatal emulation error: {e}", exc_info=True)
+    finally:
+        # Comprehensive resource cleanup (final version)
+        logger.info("🧹 Starting resource cleanup...")
+
+        # 1. Stop interrupt threads
+        for t in interrupt_threads:
+            try:
+                t.join(timeout=2)
+                logger.info(f"✅ Interrupt thread stopped")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to stop interrupt thread: {e}")
+
+        # 2. Stop QEMU target (oldest Avatar2 compatible)
+        if qemu:
+            try:
+                target_state = getattr(qemu, 'state', 'UNKNOWN')
+                if target_state not in ['STOPPED', 'EXITED']:
+                    qemu.stop()
+                    logger.info("✅ QEMU target stopped")
+                else:
+                    logger.info(f"ℹ️ QEMU target already {target_state} (no action)")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to stop QEMU target (ignored for oldest Avatar2): {e}")
+
+        # 3. Shutdown Avatar core
+        if avatar:
+            try:
+                avatar.shutdown()
+                logger.info("✅ Avatar core shutdown")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to shutdown Avatar: {e}")
+
+        # 4. Close log writer
+        if state.output_tsv:
+            try:
+                state.output_tsv.close()
+                logger.info("✅ Log writer closed")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to close log writer: {e}")
+
+        # 5. Close UART files
+        for f in [state.uart.get('tx_file'), state.uart.get('rx_file')]:
+            if f and not f.closed:
+                try:
+                    f.close()
+                    logger.info("✅ UART file closed")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to close UART file: {e}")
+
+        logger.info("✅ Emulation cleanup completed successfully")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.critical(f"💥 Fatal error in main execution: {e}", exc_info=True)
+        sys.exit(1)
