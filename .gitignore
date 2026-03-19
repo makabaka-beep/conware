@@ -1,3 +1,28 @@
+# 编译产物
+*.o
+*.a
+*.so
+*.i
+*.s
+*.bc
+build/
+build_gcc/
+llvm_build_infra/llvm_transformation_passes/build/
+
+# 冗余文件
+*.zip
+*.tar.gz
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# 虚拟环境
+venv/
+conware-venv/
+
+# STM32 固件库（可选：若不想上传完整 HAL 库，添加以下行）
+# runtime/stm32f4_hal/
 # Byte-compiled / optimized / DLL files
 *.png
 *.svg
