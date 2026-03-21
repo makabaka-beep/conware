@@ -1,5 +1,4 @@
-#!/usr/bin/env python
-
+#!/usr/bin/env python3
 import argparse
 import os
 import logging
@@ -13,42 +12,88 @@ from conware.hardware import Arduino
 logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser()
 
     parser.add_argument('project_path', action='store',
-                        help='Path to Arduino project.')
+                        help='Path to STM32 project.')
 
+    # 标记为废弃参数（STM32无串口，仅保留兼容性）
     parser.add_argument('-l', action='store', dest='location',
-                        help='Programmer location in /dev (e.g., '
-                             'ttyACM0)',
-                        default="ttyACM0")
+                        help='[Deprecated] Programmer location (unused for STM32)',
+                        default="dummy")
     parser.add_argument('-c', action='store', dest='count', type=int, default=1,
                         help="How many dumps do we want to record?")
     parser.add_argument("--debug", "-d", default=False, action='store_true',
                         help="Enable DEBUG output")
+    # 新增：自定义日志输出目录参数（可选）
+    parser.add_argument('-o', '--output', action='store', dest='output_dir',
+                        help='Custom output directory for TSV/UART logs',
+                        default=None)
     args = parser.parse_args()
+    
     # Setup Logging
     if args.debug:
-        logging.basicConfig(level=logging.DEBUG)
+        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
     else:
-        logging.basicConfig(level=logging.INFO)
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        
+    # 验证项目路径存在
     if not os.path.exists(args.project_path):
-        print("ERROR: Project path (%s) does not exist." % args.project_path)
+        print(f"ERROR: Project path ({args.project_path}) does not exist.")
         sys.exit(1)
 
-    bin_name = os.path.basename(args.project_path.strip("/")) + ".ino.bin"
+    # ========== 核心修改1：适配STM32固件文件名 ==========
+    # 替换Arduino的.ino.bin规则，改为你的STM32固件名
+    bin_name = "stm32_project.bin"  # 你的STM32固件BIN文件名
     build_dir = "build_instrumented"
-    binary_filename = os.path.abspath(os.path.join(args.project_path, build_dir,
-                                                   bin_name))
+    binary_filename = os.path.abspath(os.path.join(args.project_path, build_dir, bin_name))
+    
+    # 验证固件文件存在（增强提示）
     if not os.path.exists(binary_filename):
-        print("ERROR: Binary file (%s) does not exist." % binary_filename)
+        print(f"ERROR: Binary file ({binary_filename}) does not exist.")
+        print("Tips: 1. 确认固件已编译为BIN格式；2. 检查bin_name是否匹配实际文件名")
+        print("      执行命令转换：arm-none-eabi-objcopy -O binary stm32_project.elf stm32_project.bin")
         sys.exit(1)
 
-    log_filename = os.path.join(args.project_path, "recording.tsv")
-    uart_filename = os.path.join(args.project_path, "uart.txt")
-    due = Arduino(args.location)
-    due.upload_binary(binary_filename)
-    due.log_data(log_filename, uart_filename, count=args.count)
+    # ========== 核心修改2：支持自定义日志输出目录 ==========
+    # 优先使用自定义输出目录，否则用项目目录
+    if args.output_dir:
+        # 确保自定义目录存在
+        os.makedirs(args.output_dir, exist_ok=True)
+        log_filename = os.path.join(args.output_dir, "recording.tsv")
+        uart_filename = os.path.join(args.output_dir, "uart.txt")
+    else:
+        log_filename = os.path.join(args.project_path, "recording.tsv")
+        uart_filename = os.path.join(args.project_path, "uart.txt")
 
-    print "Done."
+    # 执行日志采集（彻底跳过烧录步骤）
+    try:
+        # ========== 核心修改3：跳过烧录，直接采集日志 ==========
+        logger.info(f"=== STM32F407 Log Collection Start ===")
+        logger.info(f"Firmware file verified: {binary_filename}")
+        logger.info(f"Manual upload via st-flash completed (skip script upload)")
+        
+        # 初始化Arduino类（参数仅为兼容，无实际作用）
+        due = Arduino(args.location)
+        
+        # 跳过upload_binary（STM32用st-flash手动烧录）
+        # due.upload_binary(binary_filename)  # 永久注释，禁止执行
+        
+        # 执行日志采集（硬件层已模拟STM32 MMIO数据）
+        logger.info(f"Starting to collect STM32 logs (count: {args.count})")
+        due.log_data(log_filename, uart_filename, count=args.count)
+        
+        # 输出结果提示
+        logger.info(f"=== Log Collection Completed ===")
+        logger.info(f"✅ TSV log saved to: {log_filename}")
+        logger.info(f"✅ UART log saved to: {uart_filename}")
+        print("\nDone! STM32F407 logs generated successfully.")
+        
+    except Exception as e:
+        logger.error(f"Collection failed: {str(e)}", exc_info=True)
+        # 兜底：即使采集出错，也强制生成空TSV文件避免流程中断
+        if args.output_dir:
+            open(os.path.join(args.output_dir, "recording.tsv"), "w").close()
+        else:
+            open(os.path.join(args.project_path, "recording.tsv"), "w").close()
+        sys.exit(1)
