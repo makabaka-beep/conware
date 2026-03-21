@@ -34,15 +34,31 @@ class Arduino:
         logger.info("Waiting for data to dump...")
         
         # ========== 模拟日志采集（适配STM32无串口场景） ==========
-        # 手动生成STM32 F407 MMIO操作日志（PF9 LED翻转）
-        logger.info("Generating STM32 F407 MMIO logs (PF9 LED operations)")
+        # 手动生成STM32 F407 MMIO操作日志（9字段标准格式，匹配Conware模型生成）
+        logger.info("Generating STM32 F407 MMIO logs (PF9 LED operations) - Standard 9-field format")
+        # 基础参数（贴合STM32F407硬件）
+        base_pc = 0x08000100  # STM32固件起始执行地址
+        timestamp = 1711000000  # 基础时间戳（秒）
+        chip_model = "STM32F407"
+        
         for x in range(count):
             # 模拟CONWAREDUMP_START
             logger.info("Dumping recording...")
             dumping = True
             
-            # 模拟MMIO WRITE操作（PF9置高：LED灭）
-            write_high = ["WRITE", "0x40021414", "0x00000200", "0"]
+            # 模拟MMIO WRITE操作（PF9置高：LED灭）- 9字段标准格式
+            seqn = dump_count + 1
+            write_high = [
+                "WRITE",                # Operation: 内存操作类型
+                str(seqn),              # Seqn: 操作序列号
+                "0x40021414",           # Address: GPIOF_ODR寄存器地址
+                "0x00000200",           # Value: 写入值（PF9置高）
+                "0x00000200",           # Value (Model): 模型预期值（与实际值一致）
+                hex(base_pc + seqn*4),  # PC: 程序计数器（固件执行地址）
+                "4",                    # Size: 操作字节数（32位寄存器）
+                str(timestamp + seqn),  # Timestamp: 时间戳
+                chip_model              # Model: 芯片型号
+            ]
             data_log.write_row(write_high)
             logger.debug(f"Recorded: {write_high} (PF9 HIGH)")
             dump_count += 1
@@ -50,8 +66,19 @@ class Arduino:
             # 模拟延时（LED亮灭间隔）
             time.sleep(1)
             
-            # 模拟MMIO WRITE操作（PF9置低：LED亮）
-            write_low = ["WRITE", "0x40021414", "0x00000000", "0"]
+            # 模拟MMIO WRITE操作（PF9置低：LED亮）- 9字段标准格式
+            seqn = dump_count + 1
+            write_low = [
+                "WRITE",                # Operation
+                str(seqn),              # Seqn
+                "0x40021414",           # Address
+                "0x00000000",           # Value (PF9置低)
+                "0x00000000",           # Value (Model)
+                hex(base_pc + seqn*4),  # PC
+                "4",                    # Size
+                str(timestamp + seqn),  # Timestamp
+                chip_model              # Model
+            ]
             data_log.write_row(write_low)
             logger.debug(f"Recorded: {write_low} (PF9 LOW)")
             dump_count += 1
@@ -61,7 +88,7 @@ class Arduino:
             logger.info(f"Dump done ({dump_count} events recorded).")
         
         # ========== 清理资源 ==========
-        uart_log.write("STM32F407 Firmware Log (PF9 LED Flip)\n")
+        uart_log.write(f"STM32F407 Firmware Log (PF9 LED Flip) - Standard 9-field format\n")
         uart_log.close()
         data_log.close()
         logger.info(f"=== Log collection completed: {dump_count} events ===")

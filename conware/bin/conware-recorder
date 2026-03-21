@@ -25,9 +25,9 @@ if __name__ == "__main__":
                         help="How many dumps do we want to record?")
     parser.add_argument("--debug", "-d", default=False, action='store_true',
                         help="Enable DEBUG output")
-    # 新增：自定义日志输出目录参数（可选）
+    # 保留自定义输出目录参数（可选）
     parser.add_argument('-o', '--output', action='store', dest='output_dir',
-                        help='Custom output directory for TSV/UART logs',
+                        help='Custom output directory for TSV/UART logs (default: project_path/src)',
                         default=None)
     args = parser.parse_args()
     
@@ -43,7 +43,6 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # ========== 核心修改1：适配STM32固件文件名 ==========
-    # 替换Arduino的.ino.bin规则，改为你的STM32固件名
     bin_name = "stm32_project.bin"  # 你的STM32固件BIN文件名
     build_dir = "build_instrumented"
     binary_filename = os.path.abspath(os.path.join(args.project_path, build_dir, bin_name))
@@ -55,16 +54,20 @@ if __name__ == "__main__":
         print("      执行命令转换：arm-none-eabi-objcopy -O binary stm32_project.elf stm32_project.bin")
         sys.exit(1)
 
-    # ========== 核心修改2：支持自定义日志输出目录 ==========
-    # 优先使用自定义输出目录，否则用项目目录
+    # ========== 核心修改2：日志路径逻辑（优先自定义目录，否则默认到src目录） ==========
     if args.output_dir:
-        # 确保自定义目录存在
+        # 1. 使用自定义输出目录（-o参数指定）
         os.makedirs(args.output_dir, exist_ok=True)
         log_filename = os.path.join(args.output_dir, "recording.tsv")
         uart_filename = os.path.join(args.output_dir, "uart.txt")
+        logger.info(f"Custom output directory specified: {args.output_dir}")
     else:
-        log_filename = os.path.join(args.project_path, "recording.tsv")
-        uart_filename = os.path.join(args.project_path, "uart.txt")
+        # 2. 默认保存到.c文件所在的src目录（project_path/src）
+        src_dir = os.path.join(args.project_path, "src")
+        os.makedirs(src_dir, exist_ok=True)
+        log_filename = os.path.join(src_dir, "recording.tsv")
+        uart_filename = os.path.join(src_dir, "uart.txt")
+        logger.info(f"Using default output directory (.c files dir): {src_dir}")
 
     # 执行日志采集（彻底跳过烧录步骤）
     try:
@@ -95,5 +98,7 @@ if __name__ == "__main__":
         if args.output_dir:
             open(os.path.join(args.output_dir, "recording.tsv"), "w").close()
         else:
-            open(os.path.join(args.project_path, "recording.tsv"), "w").close()
+            src_dir = os.path.join(args.project_path, "src")
+            os.makedirs(src_dir, exist_ok=True)
+            open(os.path.join(src_dir, "recording.tsv"), "w").close()
         sys.exit(1)
