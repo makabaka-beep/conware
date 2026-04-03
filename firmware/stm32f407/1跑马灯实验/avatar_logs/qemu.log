@@ -1,0 +1,2 @@
+2026-04-01 13:00:29,333 | avatar.targets.qemu.INFO | QEMU process running
+2026-04-01 13:00:34,407 | avatar.targets.qemu.GDBProtocol.CRITICAL | GDBProtocol was unable to connect to remote target

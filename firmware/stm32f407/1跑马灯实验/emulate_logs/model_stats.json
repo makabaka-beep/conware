@@ -1,0 +1,16 @@
+{
+  "missed_reads": 0,
+  "missed_writes": 0,
+  "total_reads": 0,
+  "total_writes": 0,
+  "interrupts": 0,
+  "SPI1": {
+    "reads": [],
+    "writes": [],
+    "interrupts": [],
+    "wildcard": 0,
+    "bfs": 0,
+    "long_jump": 0,
+    "failed": 0
+  }
+}
