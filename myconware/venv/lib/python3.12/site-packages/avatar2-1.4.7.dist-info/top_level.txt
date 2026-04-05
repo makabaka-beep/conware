@@ -1,0 +1,8 @@
+avatar2
+avatar2/archs
+avatar2/installer
+avatar2/peripherals
+avatar2/plugins
+avatar2/plugins/arm
+avatar2/protocols
+avatar2/targets

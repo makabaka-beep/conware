@@ -1,0 +1,4 @@
+avatar2
+setuptools<70
+networkx
+PyYAML

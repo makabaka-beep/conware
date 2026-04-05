@@ -1,0 +1,28 @@
+Metadata-Version: 2.1
+Name: avatar2
+Version: 1.4.7
+Summary: A Dynamic Multi-Target Orchestration Framework
+Home-page: https://github.com/avatartwo/avatar2
+Maintainer: Marius Muench
+Maintainer-email: marius.muench@eurecom.fr
+License: UNKNOWN
+Platform: UNKNOWN
+Requires-Dist: bitstring
+Requires-Dist: capstone (>=3.0.4)
+Requires-Dist: configparser
+Requires-Dist: intervaltree
+Requires-Dist: keystone-engine
+Requires-Dist: npyscreen
+Requires-Dist: parse
+Requires-Dist: posix-ipc (>=1.0.0)
+Requires-Dist: pylink-square
+Requires-Dist: pyusb
+Requires-Dist: unicorn
+Requires-Dist: enum34 ; python_version < "3.4"
+Requires-Dist: pygdbmi (==0.9.0.2) ; python_version <= "3.5"
+Requires-Dist: cached-property ; python_version <= "3.8"
+Requires-Dist: pygdbmi (>=0.10.0.0) ; python_version > "3.5"
+
+UNKNOWN
+
+
