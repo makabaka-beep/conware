@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # Native
 import argparse
+import json
 import os
 import pprint
 import sys
@@ -345,11 +346,27 @@ def emulate_interrupt_exit(avatar, message, **kwargs):
 if __name__ == '__main__':
     args = parse_args()
 
+    # STM32 等工程可在录制目录下放 board.yaml（指向 stm32f407.yaml），避免误用默认 due.yaml
+    recording_board = os.path.join(args.recording_dir, 'board.yaml')
+    if os.path.isfile(recording_board):
+        args.board_config = os.path.abspath(recording_board)
+        logger.info("Using board config from recording directory: %s" %
+                    args.board_config)
+
     config = None
     if args.board_config:
         logger.info("Using board configuration from %s " % args.board_config)
         with open(args.board_config) as f:
-            config = yaml.load(f, Loader=yaml.FullLoader)
+            config = yaml.safe_load(f)
+
+    if not config or not isinstance(config.get('memory_map'), dict):
+        logger.error(
+            "Board config missing or invalid (need memory_map). "
+            "For STM32F407 use: --board-config conware/configs/stm32f407.yaml "
+            "or place board.yaml in the recording directory.")
+        sys.exit(1)
+
+    qemu_cpu_model = config.get('cpu_model')
 
     # Let's setup avatar
     logger.info("Creating Avatar instance...")
@@ -381,17 +398,19 @@ if __name__ == '__main__':
         qemu_args += ['-d', 'exec', '-D', COVERAGE_LOG]
     else:
         qemu_args += ['-d', 'in_asm', '-D', COVERAGE_LOG]
-    # qemu_args += ["-M","lm3s811evb"]
-    print ('qemu_args=%s' %qemu_args)
+    firmware_abs = os.path.abspath(args.sample)
+    if qemu_cpu_model:
+        logger.info("QEMU cpu_model from board config: %s" % qemu_cpu_model)
     qemu = avatar.add_target(QemuTarget, name='qemu',
                              gdb_executable="gdb-multiarch",
-                             firmware=args.sample,
+                             firmware=firmware_abs,
                              executable=args.qemu_executable,
                              additional_args=qemu_args,
-                             system_clock_scale=args.system_clock_scale)
+                             system_clock_scale=args.system_clock_scale,
+                             cpu_model=qemu_cpu_model)
     qemu.gdb_port = args.qemu_port
 
-    if "uart" in config:
+    if config and "uart" in config:
         UART['tx'] = config['uart']['tx']
         UART['rx'] = config['uart']['rx']
 
@@ -410,7 +429,7 @@ if __name__ == '__main__':
 
     mmio = None
 
-    # Define our memory map for this board
+    # Define our memory map for this board (must match recording / .bin 链接地址)
     logger.info("Configuring memory layout...")
     for region, params in config['memory_map'].items():
         base = params['base']
@@ -432,7 +451,7 @@ if __name__ == '__main__':
         elif region == 'rom':
             avatar.add_memory_range(base, size, name=region,
                                     forwarded=forwarded,
-                                    forwarded_to=None, file=args.sample)
+                                    forwarded_to=None, file=firmware_abs)
         # elif region == 'nvic':
         #     avatar.add_memory_range(base, size, name=region,
         #                             forwarded=forwarded,
@@ -446,7 +465,8 @@ if __name__ == '__main__':
     avatar.init_targets()
 
     # Set our output file
-    OUTPUT_TSV = LogWriter(os.path.join(args.recording_dir, args.output_file))
+    output_csv = os.path.join(args.recording_dir, args.output_file)
+    OUTPUT_TSV = LogWriter(output_csv)
     # Set our hooks
     avatar.watchmen.add_watchman('RemoteMemoryWrite', 'after',
                                  emulate_write_after)
@@ -481,12 +501,12 @@ if __name__ == '__main__':
     # Set our PC and SP
     # Setup our binary parser
     # TODO: Abstract this.
-    bin_parser = M3Parser(args.sample)
+    bin_parser = M3Parser(firmware_abs)
 
     qemu.regs.pc = bin_parser.get_entry_point()
     qemu.regs.sp = bin_parser.get_initial_sp()
-    qemu.regs.xpsr = 0x41000000 #set thumb
-    print ('pc=0x%x, sp=0x%x' %(qemu.regs.pc, qemu.regs.sp))
+    qemu.regs.xpsr = 0x41000000  # Thumb
+    logger.info("pc=0x%x, sp=0x%x" % (qemu.regs.pc, qemu.regs.sp))
 
     # Update our IVT?
     if 'ivt_address' in args.__dict__ and args.ivt_address:
@@ -514,6 +534,10 @@ if __name__ == '__main__':
 
     try:
         qemu.stop()
+    except Exception:
+        pass
+    try:
+        OUTPUT_TSV.close()
     except Exception:
         pass
     print("Shutting down Avatar...")
