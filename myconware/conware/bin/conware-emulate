@@ -129,6 +129,14 @@ def emulate_read_after(avatar, message, **kwargs):
 
     model_val = 0
 
+    # 从模型获取真实返回值（Conware.read_memory -> ConwareModel.read_memory）
+    if message.dst and hasattr(message.dst, 'forwarded_to'):
+        try:
+            # Conware.read_memory(address, size) -> ConwareModel.read_memory(address, size)
+            model_val = message.dst.forwarded_to.read_memory(message.address, message.size)
+        except Exception as e:
+            logger.debug(f"模型读取失败: {e}")
+
     try:
         model_name = message.dst.forwarded_to.model.get_model(message.address)
     except:
@@ -146,7 +154,6 @@ def emulate_read_after(avatar, message, **kwargs):
         logger.debug(
             "READ:  %s (%s, %s, %s) @ %s" % (message, hex(message.address),
                                              val, model_val, hex(message.pc)))
-        # logger.info("MODEL: %s, %s" % (hex(message.address), model_val))
         OUTPUT_TSV.write_row(
             ['READ', seq,
              "0x%08x" % message.address,
@@ -177,7 +184,7 @@ def emulate_write_after(avatar, message, **kwargs):
     _, val, success = kwargs['watched_return']
 
     val = message.value
-    model_val = 0
+    model_val = val  # 写入操作的模型值就是写入的值
 
     # Get the model name
     try:
@@ -188,6 +195,13 @@ def emulate_write_after(avatar, message, **kwargs):
                 message.address)
         except:
             model_name = "ERR"
+
+    # 调用模型的 write 方法更新状态（Conware.write_memory -> ConwareModel.write_memory）
+    if message.dst and hasattr(message.dst, 'forwarded_to'):
+        try:
+            message.dst.forwarded_to.write_memory(message.address, message.size, val)
+        except Exception as e:
+            logger.debug(f"模型写入失败: {e}")
 
     if not message.dst or "model" in message.dst.name:
         logger.debug("IGNW %s (%s,%s) @ %s" % (message, hex(message.address),
